@@ -54,6 +54,13 @@ shortcuts in Settings > Keybindings.
 On iPhone and iPad, long-press the terminal to paste or to choose Select Text.
 Select Text shows the visible output, where you can copy text or tap a link.
 
+## Open a file from terminal output
+
+On web and desktop, click a path like `src/app.ts:42` in terminal output to open
+a workspace source file at the reported line in the right panel. To open it in
+your preferred editor, hold Cmd on macOS or Ctrl on Windows and Linux while
+clicking.
+
 ## fish
 
 T3 Code starts fish with `no-query-term`, avoiding startup waits for terminal

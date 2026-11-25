@@ -35,6 +35,8 @@ import {
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
+import { splitFilePathPosition } from "@t3tools/shared/fileLinks";
+import { isHostPath, workspaceRelativeFilePath } from "@t3tools/shared/path";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabelsCopy";
 import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/reactivity";
@@ -61,6 +63,7 @@ import {
 } from "~/terminal/ghostty/surface";
 import { type GhosttyColor, type GhosttyTheme } from "~/terminal/ghostty/core";
 import { useOpenInPreferredEditor } from "../editorPreferences";
+import { rightPanelHostRef, useRightPanelStore } from "../rightPanelStore";
 import { isTerminalUrl, resolveTerminalLinkTarget } from "../terminal-links";
 import {
   isDiffToggleShortcut,
@@ -92,6 +95,7 @@ import { previewEnvironment } from "../state/preview";
 import { readEnvironmentScope } from "../state/session";
 import { terminalEnvironment } from "../state/terminal";
 import { useEnvironmentScope } from "../state/session";
+import { getProjectFileQueryAtom } from "./files/projectFilesQueryState";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
 import { terminalInputWriter } from "./terminal/terminalInputWriter";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -485,6 +489,7 @@ interface TerminalViewportProps {
   terminalId: string;
   terminalLabel: string;
   cwd: string;
+  filePanelRoot?: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
   providerInstanceId?: ProviderInstanceId;
@@ -521,6 +526,7 @@ function TerminalSessionViewport({
   terminalId,
   terminalLabel,
   cwd,
+  filePanelRoot,
   worktreePath,
   runtimeEnv,
   providerInstanceId,
@@ -545,7 +551,6 @@ function TerminalSessionViewport({
   const metadataThreadRef = useContext(FileMetadataThreadContext);
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const hostname = serverConfig?.hostname;
-  const readHostname = useEffectEvent(() => hostname);
   const linkMetadataQuery =
     linkPath !== null && canOpenHostEditor && canReadFilesystem
       ? getFileMetadataQueryAtom(
@@ -587,7 +592,59 @@ function TerminalSessionViewport({
     serverConfig?.availableEditors ?? [],
     worktreePath ?? cwd,
   );
-  const openTerminalPath = useEffectEvent((target: string) => openInPreferredEditor(target));
+  const readFilePanelRoot = useEffectEvent(() =>
+    rightPanelHostRef(threadRef) === threadRef ? filePanelRoot : undefined,
+  );
+  const activateTerminalPath = useEffectEvent(
+    async (text: string, event: MouseEvent, terminal: GhosttyTerminalSurface) => {
+      const target = resolveTerminalLinkTarget(text, cwd, hostname);
+      const root = readFilePanelRoot();
+      const { path, line } = splitFilePathPosition(target);
+      const relativePath = workspaceRelativeFilePath(path, root);
+      if (
+        root &&
+        relativePath &&
+        !isHostPath(relativePath) &&
+        relativePath.split("/").every((part) => part && part !== "." && part !== "..") &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        !/^(?:file:|~[\\/])/iu.test(text) &&
+        readEnvironmentScope(environmentId, AuthFilesystemReadScope)
+      ) {
+        const panel = useRightPanelStore.getState();
+        const revision = panel.markUserAction(threadRef);
+        const result = await executeAtomQuery(
+          appAtomRegistry,
+          getProjectFileQueryAtom(environmentId, root, relativePath),
+          { reportFailure: false },
+        );
+        if (result._tag === "Success" && result.value.exists !== false) {
+          if (
+            terminalRef.current === terminal &&
+            visibleRef.current &&
+            readFilePanelRoot() === root &&
+            panel.getUserActionRevision(threadRef) === revision &&
+            readEnvironmentScope(environmentId, AuthFilesystemReadScope)
+          ) {
+            panel.openFile(threadRef, relativePath, line);
+          }
+          return;
+        }
+      }
+      if (!readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) return;
+      const result = await openInPreferredEditor(target);
+      if (
+        result._tag === "Success" ||
+        isAtomCommandInterrupted(result) ||
+        terminalRef.current !== terminal
+      )
+        return;
+      const error = squashAtomCommandFailure(result);
+      writeSystemMessage(terminal, thrownErrorMessage(error, m) ?? m(msg("Unable to open path")));
+    },
+  );
   const openPreview = useAtomCommand(previewEnvironment.open, {
     reportFailure: false,
   });
@@ -1120,18 +1177,7 @@ function TerminalSessionViewport({
           );
           return;
         }
-        const target = resolveTerminalLinkTarget(text, cwd, readHostname());
-        void (async () => {
-          const result = await openTerminalPath(target);
-          if (result._tag === "Success" || isAtomCommandInterrupted(result)) {
-            return;
-          }
-          const error = squashAtomCommandFailure(result);
-          writeSystemMessage(
-            latestTerminal,
-            thrownErrorMessage(error, m) ?? m(msg("Unable to open path")),
-          );
-        })();
+        void activateTerminalPath(text, event, latestTerminal);
       }
 
       function handleData(data: string): void {
@@ -1200,7 +1246,7 @@ function TerminalSessionViewport({
         mount.focus({ preventScroll: true });
       }
     };
-  }, [cwd, environmentId, terminalId, terminalSessionAtom, threadId]);
+  }, [environmentId, terminalId, terminalSessionAtom, threadId]);
 
   const attachContainer = (mount: HTMLDivElement) => {
     containerRef.current = mount;
@@ -1243,6 +1289,7 @@ interface ThreadTerminalDrawerProps {
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
   cwd: string;
+  filePanelRoot: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
   visible?: boolean;
@@ -1319,6 +1366,7 @@ function TerminalSplitPanes({
   activeTerminalId,
   terminalLabelById,
   resolveLaunchLocation,
+  filePanelRoot,
   onActiveTerminalChange,
   onCloseTerminal,
   advancedTypography,
@@ -1333,6 +1381,7 @@ function TerminalSplitPanes({
   activeTerminalId: string;
   terminalLabelById: ReadonlyMap<string, string>;
   resolveLaunchLocation: (terminalId: string) => TerminalLaunchLocation;
+  filePanelRoot: string;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string, threadRef?: ScopedThreadRef) => void;
   advancedTypography: boolean;
@@ -1380,6 +1429,7 @@ function TerminalSplitPanes({
                 terminalId={terminalId}
                 terminalLabel={terminalLabelById.get(terminalId) ?? gt("Terminal")}
                 cwd={terminalLaunchLocation.cwd}
+                filePanelRoot={filePanelRoot}
                 {...(terminalLaunchLocation.worktreePath !== undefined
                   ? { worktreePath: terminalLaunchLocation.worktreePath }
                   : {})}
@@ -1506,6 +1556,7 @@ export default function ThreadTerminalDrawer({
   threadRef,
   threadId,
   cwd,
+  filePanelRoot,
   worktreePath,
   runtimeEnv,
   visible = true,
@@ -1937,6 +1988,7 @@ export default function ThreadTerminalDrawer({
               activeTerminalId={resolvedActiveTerminalId}
               terminalLabelById={terminalLabelById}
               resolveLaunchLocation={resolveTerminalLaunchLocation}
+              filePanelRoot={filePanelRoot}
               onActiveTerminalChange={onActiveTerminalChange}
               onCloseTerminal={onCloseTerminal}
               advancedTypography={advancedTypography}

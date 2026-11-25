@@ -7,14 +7,16 @@ import {
   ThreadId,
   type ScopedThreadRef,
   type FilesystemEntryMetadata,
+  type ProjectReadFileResult,
   type ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
-import { Cause } from "effect";
+import { Cause, Effect } from "effect";
+import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import { compileResolvedKeybindingsConfig, DEFAULT_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { Atom, AsyncResult } from "effect/reactivity";
 import type { GhosttyTerminalSurfaceOptions } from "~/terminal/ghostty/surface";
 import { AppAtomRegistryProvider, appAtomRegistry } from "../rpc/atomRegistry";
-import { useRightPanelStore } from "../rightPanelStore";
+import { selectActiveRightPanelSurface, useRightPanelStore } from "../rightPanelStore";
 import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { extractTerminalLinks } from "../terminal-links";
 import { expect, it, vi } from "vite-plus/test";
@@ -46,6 +48,8 @@ const fixture = vi.hoisted(() => ({
     string,
     Atom.Writable<AsyncResult.AsyncResult<FilesystemEntryMetadata | null>>
   >(),
+  projectFiles: new Map<string, Atom.Atom<AsyncResult.AsyncResult<ProjectReadFileResult, Error>>>(),
+  editorPaths: [] as string[],
 }));
 
 // Every other surface method is a no-op; `then` stays undefined so awaiting the surface resolves to it.
@@ -200,7 +204,19 @@ vi.mock("../state/projects", async () => {
     },
   };
 });
-vi.mock("../editorPreferences", () => ({ useOpenInPreferredEditor: () => () => {} }));
+vi.mock("./files/projectFilesQueryState", () => ({
+  getProjectFileQueryAtom: (_environmentId: string, cwd: string, path: string) => {
+    const atom = fixture.projectFiles.get(`${cwd}/${path}`);
+    if (!atom) throw new Error(`Unexpected project read for ${cwd}/${path}`);
+    return atom;
+  },
+}));
+vi.mock("../editorPreferences", () => ({
+  useOpenInPreferredEditor: () => async (path: string) => {
+    fixture.editorPaths.push(path);
+    return AsyncResult.success(undefined);
+  },
+}));
 vi.mock("./preview/openTerminalLinkInPreview", () => ({ openTerminalLinkInPreview: () => {} }));
 vi.mock("~/localApi", () => ({ readLocalApi: () => null }));
 vi.mock("../hooks/useSettings", async () => {
@@ -224,6 +240,7 @@ function Drawer(props: {
       threadRef={props.threadRef}
       threadId={props.threadRef.threadId}
       cwd={props.cwd ?? "/repo"}
+      filePanelRoot={props.cwd ?? "/repo"}
       height={240}
       terminalIds={["term-1"]}
       activeTerminalId="term-1"
@@ -265,6 +282,8 @@ function setup(originalStatus: "starting" | "exited" = "exited") {
   fixture.runResize = () => Promise.resolve(AsyncResult.success(undefined));
   fixture.runWrite = () => Promise.resolve({ _tag: "Success" });
   fixture.metadata.clear();
+  fixture.projectFiles.clear();
+  fixture.editorPaths = [];
   useRightPanelStore.setState(useRightPanelStore.getInitialState());
   useTerminalUiStateStore.setState(useTerminalUiStateStore.getInitialState());
   return { original, other };
@@ -427,6 +446,98 @@ it("only activates terminal paths confirmed to exist on their environment", asyn
   expect(await validate("~/notes.ts:5:2")).toBe(true);
   await hover("~/notes.ts:5:2");
   expect(canActivate("~/notes.ts:5:2")).toBe(true);
+});
+
+it("opens a workspace file at its line and preserves editor routes", async () => {
+  const { other: threadRef } = setup();
+  const path = "src/main.ts";
+  fixture.projectFiles.set(
+    `/repo/${path}`,
+    Atom.make(
+      AsyncResult.success({
+        relativePath: path,
+        contents: "",
+        byteLength: 0,
+        truncated: false,
+      }),
+    ),
+  );
+  fixture.projectFiles.set(
+    "/repo/src/alias.ts",
+    Atom.make(
+      AsyncResult.failure<ProjectReadFileResult, Error>(
+        Cause.fail(new Error("File resolves outside the workspace")),
+      ),
+    ),
+  );
+  await using _screen = await render(
+    <AppAtomRegistryProvider>
+      <Drawer threadRef={threadRef} onCloseTerminal={() => {}} />
+    </AppAtomRegistryProvider>,
+  );
+  await act(async () => {
+    fixture.pendingSurfaces.shift()?.();
+  });
+  const click = (target: string, ctrlKey = false) =>
+    act(() =>
+      fixture.surfaceOptions.at(-1)!.onLinkActivate(target, new MouseEvent("click", { ctrlKey })),
+    );
+  await click(`${path}:12:7`);
+  await vi.waitFor(() =>
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+    ).toMatchObject({ kind: "file", relativePath: path, revealLine: 12 }),
+  );
+  expect(fixture.editorPaths).toEqual([]);
+
+  await click(`${path}:12:7`, true);
+  await click("/repo/src/alias.ts");
+  await click("/outside/notes.ts");
+  await click("file:///repo/src/main.ts#L12");
+  await click("src/../notes.ts");
+  await click("~/notes.ts");
+  await vi.waitFor(() =>
+    expect(fixture.editorPaths).toEqual([
+      `/repo/${path}:12:7`,
+      "/repo/src/alias.ts",
+      "/outside/notes.ts",
+      "file:///repo/src/main.ts#L12",
+      "/repo/src/../notes.ts",
+      "~/notes.ts",
+    ]),
+  );
+});
+
+it("keeps the later panel selection while a terminal file read is pending", async () => {
+  const { other: threadRef } = setup();
+  const response = Promise.withResolvers<ProjectReadFileResult>();
+  const pending = Atom.make(Effect.promise(() => response.promise));
+  fixture.projectFiles.set("/repo/src/main.ts", pending);
+  await using _screen = await render(
+    <AppAtomRegistryProvider>
+      <Drawer threadRef={threadRef} onCloseTerminal={() => {}} />
+    </AppAtomRegistryProvider>,
+  );
+  await act(async () => {
+    fixture.pendingSurfaces.shift()?.();
+  });
+  await act(() =>
+    fixture.surfaceOptions.at(-1)!.onLinkActivate("src/main.ts:12", new MouseEvent("click")),
+  );
+  await act(async () => {
+    useRightPanelStore.getState().openFile(threadRef, "picked.txt");
+    response.resolve({
+      relativePath: "src/main.ts",
+      contents: "",
+      byteLength: 0,
+      truncated: false,
+    });
+    await executeAtomQuery(appAtomRegistry, pending);
+  });
+  expect(
+    selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+  ).toMatchObject({ kind: "file", relativePath: "picked.txt" });
+  expect(fixture.editorPaths).toEqual([]);
 });
 
 it("drops the rest of a split paste when the shell restarts mid-paste", async () => {
